@@ -10,23 +10,45 @@ import {
   ModalBuilder,
   TextInputBuilder,
   TextInputStyle,
+  InteractionType,
 } from "discord.js";
-import express from "express";
+import fs from "fs";
 import dotenv from "dotenv";
 dotenv.config();
-
-const app = express();
-app.get("/", (_req, res) => res.send("Bot is online."));
-app.listen(3000, () => console.log("🌐 Web server running for uptime"));
 
 const client = new Client({
   intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
 });
 
-client.repeats = new Map();
-client.repeatIdCounter = 1;
-client.commandLogs = [];
-client.failCounts = {};
+// File paths
+const REPEATS_FILE = "./repeats.json";
+const FAILCOUNTS_FILE = "./failCounts.json";
+const COMMANDLOGS_FILE = "./commandLogs.json";
+
+// Load JSON helper
+function loadJson(path, defaultData) {
+  try {
+    if (!fs.existsSync(path)) return defaultData;
+    const data = fs.readFileSync(path, "utf-8");
+    return JSON.parse(data);
+  } catch {
+    return defaultData;
+  }
+}
+// Save JSON helper
+function saveJson(path, data) {
+  fs.writeFileSync(path, JSON.stringify(data, null, 2));
+}
+
+// Load stored data on startup
+client.repeats = new Map(loadJson(REPEATS_FILE, []).map((r) => [r.id, r]));
+client.failCounts = loadJson(FAILCOUNTS_FILE, {});
+client.commandLogs = loadJson(COMMANDLOGS_FILE, []);
+client.repeatIdCounter = client.repeats.size
+  ? Math.max(
+      ...[...client.repeats.keys()].map((id) => parseInt(id.split("_")[1])),
+    ) + 1
+  : 1;
 
 const TOKEN = process.env.TOKEN;
 const CLIENT_ID = process.env.CLIENT_ID;
@@ -75,6 +97,7 @@ const commands = [
 ].map((cmd) => cmd.toJSON());
 
 const rest = new REST({ version: "10" }).setToken(TOKEN);
+
 (async () => {
   try {
     console.log("🔁 Registering slash commands...");
@@ -87,7 +110,31 @@ const rest = new REST({ version: "10" }).setToken(TOKEN);
 
 client.once(Events.ClientReady, () => {
   console.log(`🤖 Logged in as ${client.user.tag}`);
+
+  // Restart all repeats on boot
+  for (const repeat of client.repeats.values()) {
+    const channel = client.channels.cache.get(repeat.channelId);
+    if (!channel) continue;
+
+    repeat.task = setInterval(() => {
+      channel.send({
+        content: repeat.message,
+        allowedMentions: { roles: extractRoleMentions(repeat.message) },
+      });
+    }, repeat.interval * 60000);
+  }
 });
+
+// Utility: get role IDs from a message string like <@&123>
+function extractRoleMentions(message) {
+  const regex = /<@&(\d+)>/g;
+  const roles = [];
+  let match;
+  while ((match = regex.exec(message)) !== null) {
+    roles.push(match[1]);
+  }
+  return roles;
+}
 
 function hasFullAccess(interaction) {
   const id = interaction.user.id;
@@ -96,7 +143,70 @@ function hasFullAccess(interaction) {
   return roles.has(COMMAND_ROLE) || roles.has(SUPERVISOR_ROLE);
 }
 
+// Confirmation state for large pings
+client.pendingConfirms = new Map();
+
 client.on(Events.InteractionCreate, async (interaction) => {
+  // Handle confirmation button clicks
+  if (interaction.isButton()) {
+    if (interaction.customId.startsWith("confirmSay_")) {
+      const confirmId = interaction.customId.split("_")[1];
+      const confirmData = client.pendingConfirms.get(confirmId);
+      if (!confirmData) {
+        return interaction.reply({
+          content: "Confirmation expired or invalid.",
+          ephemeral: true,
+        });
+      }
+      if (interaction.user.id !== confirmData.userId) {
+        return interaction.reply({
+          content: "You cannot confirm this action.",
+          ephemeral: true,
+        });
+      }
+      // Send message now
+      await interaction.reply({ content: "✅ Message sent!", ephemeral: true });
+      await confirmData.channel.send({
+        content: confirmData.message,
+        allowedMentions: { roles: extractRoleMentions(confirmData.message) },
+      });
+      // If repeat was requested, start it now
+      if (confirmData.repeat && confirmData.interval) {
+        const repeatId = `repeat_${client.repeatIdCounter++}`;
+        const task = setInterval(() => {
+          confirmData.channel.send({
+            content: confirmData.message,
+            allowedMentions: {
+              roles: extractRoleMentions(confirmData.message),
+            },
+          });
+        }, confirmData.interval * 60000);
+        client.repeats.set(repeatId, {
+          id: repeatId,
+          message: confirmData.message,
+          interval: confirmData.interval,
+          channelId: confirmData.channel.id,
+          task,
+        });
+        saveJson(REPEATS_FILE, [...client.repeats.values()]);
+        await interaction.followUp({
+          content: `🔁 Repeating every ${confirmData.interval} min.\n**Repeat ID:** \`${repeatId}\``,
+          ephemeral: true,
+        });
+      }
+      client.pendingConfirms.delete(confirmId);
+      return;
+    }
+    if (interaction.customId.startsWith("cancelSay_")) {
+      const confirmId = interaction.customId.split("_")[1];
+      client.pendingConfirms.delete(confirmId);
+      return interaction.reply({
+        content: "❌ Message sending canceled.",
+        ephemeral: true,
+      });
+    }
+  }
+
   if (!interaction.isChatInputCommand()) return;
 
   const name = interaction.commandName;
@@ -107,6 +217,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
     id,
     time: new Date().toLocaleString(),
   });
+  saveJson(COMMANDLOGS_FILE, client.commandLogs);
 
   if (!hasFullAccess(interaction)) {
     return interaction.reply({
@@ -120,19 +231,71 @@ client.on(Events.InteractionCreate, async (interaction) => {
     const repeat = interaction.options.getBoolean("repeat");
     const interval = interaction.options.getInteger("interval");
 
+    // Check for large ping (>5 role mentions)
+    const roleMentions = extractRoleMentions(message);
+    const largePing = roleMentions.length >= 5;
+
+    if (largePing) {
+      // Ask for confirmation with buttons
+      const {
+        ActionRowBuilder,
+        ButtonBuilder,
+        ButtonStyle,
+      } = require("discord.js");
+      const confirmId = `${interaction.id}_${Date.now()}`;
+      client.pendingConfirms.set(confirmId, {
+        userId: id,
+        message,
+        repeat,
+        interval,
+        channel: interaction.channel,
+      });
+
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`confirmSay_${confirmId}`)
+          .setLabel("Yes, send it")
+          .setStyle(ButtonStyle.Success),
+        new ButtonBuilder()
+          .setCustomId(`cancelSay_${confirmId}`)
+          .setLabel("Cancel")
+          .setStyle(ButtonStyle.Danger),
+      );
+
+      return interaction.reply({
+        content: `⚠️ Your message mentions **${roleMentions.length} roles**. Are you sure you want to send it?`,
+        components: [row],
+        ephemeral: true,
+      });
+    }
+
+    // No large ping, just send
     await interaction.reply({
       content: `✅ Message sent${repeat ? " and will repeat." : "."}`,
       ephemeral: true,
     });
-    await interaction.channel.send(message);
+    await interaction.channel.send({
+      content: message,
+      allowedMentions: { roles: roleMentions },
+    });
 
     if (repeat && interval) {
       const repeatId = `repeat_${client.repeatIdCounter++}`;
       const task = setInterval(() => {
-        interaction.channel.send(message);
+        interaction.channel.send({
+          content: message,
+          allowedMentions: { roles: roleMentions },
+        });
       }, interval * 60000);
 
-      client.repeats.set(repeatId, task);
+      client.repeats.set(repeatId, {
+        id: repeatId,
+        message,
+        interval,
+        channelId: interaction.channel.id,
+        task,
+      });
+      saveJson(REPEATS_FILE, [...client.repeats.values()]);
 
       await interaction.followUp({
         content: `🔁 Repeating every ${interval} min.\n**Repeat ID:** \`${repeatId}\``,
@@ -141,9 +304,11 @@ client.on(Events.InteractionCreate, async (interaction) => {
     }
   } else if (name === "stoprepeat") {
     const repeatId = interaction.options.getString("id");
-    if (client.repeats.has(repeatId)) {
-      clearInterval(client.repeats.get(repeatId));
+    const repeat = client.repeats.get(repeatId);
+    if (repeat) {
+      clearInterval(repeat.task);
       client.repeats.delete(repeatId);
+      saveJson(REPEATS_FILE, [...client.repeats.values()]);
       await interaction.reply({
         content: `🛑 Repeat \`${repeatId}\` stopped.`,
         ephemeral: true,
@@ -233,7 +398,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     await interaction.showModal(modal);
   } else if (
-    interaction.isModalSubmit() &&
+    interaction.type === InteractionType.ModalSubmit &&
     interaction.customId === "trainingNotesModal"
   ) {
     const { trainee, status } =
@@ -248,6 +413,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
     if (status === "F") {
       client.failCounts[trainee.id] = (client.failCounts[trainee.id] || 0) + 1;
+      saveJson(FAILCOUNTS_FILE, client.failCounts);
     }
 
     const embed = {

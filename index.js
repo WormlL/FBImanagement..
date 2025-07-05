@@ -14,6 +14,7 @@ import {
 } from "discord.js";
 import fs from "fs";
 import dotenv from "dotenv";
+import path from "path";
 dotenv.config();
 
 const client = new Client({
@@ -25,19 +26,34 @@ const REPEATS_FILE = "./repeats.json";
 const FAILCOUNTS_FILE = "./failCounts.json";
 const COMMANDLOGS_FILE = "./commandLogs.json";
 
-// Load JSON helper
-function loadJson(path, defaultData) {
+// Allowed data files (absolute paths)
+const ALLOWED_FILES = [
+  path.resolve(REPEATS_FILE),
+  path.resolve(FAILCOUNTS_FILE),
+  path.resolve(COMMANDLOGS_FILE),
+];
+
+// Secure Load JSON helper
+function loadJson(filePath, defaultData) {
+  const absPath = path.resolve(filePath);
+  if (!ALLOWED_FILES.includes(absPath)) {
+    throw new Error("Access to this file is not allowed.");
+  }
   try {
-    if (!fs.existsSync(path)) return defaultData;
-    const data = fs.readFileSync(path, "utf-8");
+    if (!fs.existsSync(absPath)) return defaultData;
+    const data = fs.readFileSync(absPath, "utf-8");
     return JSON.parse(data);
   } catch {
     return defaultData;
   }
 }
-// Save JSON helper
-function saveJson(path, data) {
-  fs.writeFileSync(path, JSON.stringify(data, null, 2));
+// Secure Save JSON helper
+function saveJson(filePath, data) {
+  const absPath = path.resolve(filePath);
+  if (!ALLOWED_FILES.includes(absPath)) {
+    throw new Error("Access to this file is not allowed.");
+  }
+  fs.writeFileSync(absPath, JSON.stringify(data, null, 2));
 }
 
 // Load stored data on startup
@@ -298,166 +314,102 @@ client.on(Events.InteractionCreate, async (interaction) => {
       saveJson(REPEATS_FILE, [...client.repeats.values()]);
 
       await interaction.followUp({
-        content: `🔁 Repeating every ${interval} min.\n**Repeat ID:** \`${repeatId}\``,
+        content: `🔁 Repeating every ${interval} minutes.\nRepeat ID: \`${repeatId}\``,
         ephemeral: true,
       });
     }
-  } else if (name === "stoprepeat") {
+  }
+
+  if (name === "stoprepeat") {
     const repeatId = interaction.options.getString("id");
-    const repeat = client.repeats.get(repeatId);
-    if (repeat) {
-      clearInterval(repeat.task);
-      client.repeats.delete(repeatId);
-      saveJson(REPEATS_FILE, [...client.repeats.values()]);
-      await interaction.reply({
-        content: `🛑 Repeat \`${repeatId}\` stopped.`,
-        ephemeral: true,
-      });
-    } else {
-      await interaction.reply({
-        content: `❌ Repeat ID \`${repeatId}\` not found.`,
+    if (!client.repeats.has(repeatId)) {
+      return interaction.reply({
+        content: `❌ No repeat found with ID \`${repeatId}\`.`,
         ephemeral: true,
       });
     }
-  } else if (name === "commandlogs") {
-    const filterUser = interaction.options.getUser("user");
-    const logs =
-      client.commandLogs
-        .filter((l) => !filterUser || l.id === filterUser.id)
-        .slice(-10)
-        .reverse()
-        .map((l) => `**${l.user}** used \`/${l.command}\` at ${l.time}`)
-        .join("\n") || "No command logs found.";
-    await interaction.reply({
-      content: `📜 **Command Logs:**\n${logs}`,
+    const repeat = client.repeats.get(repeatId);
+    clearInterval(repeat.task);
+    client.repeats.delete(repeatId);
+    saveJson(REPEATS_FILE, [...client.repeats.values()]);
+    return interaction.reply({
+      content: `🛑 Repeat with ID \`${repeatId}\` stopped.`,
       ephemeral: true,
     });
-  } else if (name === "trainingresults") {
-    const trainee = interaction.options.getUser("user");
+  }
 
-    const selectMenu = new StringSelectMenuBuilder()
-      .setCustomId("selectTrainingStatus")
-      .setPlaceholder("Select training result")
-      .addOptions(
-        { label: "PASS", value: "P" },
-        { label: "FAIL", value: "F" },
-        { label: "ON HOLD", value: "O" },
-        { label: "PARTIAL RETAKE NEEDED", value: "R" },
-      );
-
-    const row = new ActionRowBuilder().addComponents(selectMenu);
-
-    client.selectedTrainees = client.selectedTrainees || {};
-    client.selectedTrainees[interaction.user.id] = trainee;
-
-    await interaction.reply({
-      content: "Select a result for this training:",
-      components: [row],
+  if (name === "commandlogs") {
+    const userFilter = interaction.options.getUser("user");
+    let filteredLogs = client.commandLogs;
+    if (userFilter) {
+      filteredLogs = filteredLogs.filter((log) => log.id === userFilter.id);
+    }
+    if (filteredLogs.length === 0) {
+      return interaction.reply({
+        content: "No command logs found for that user.",
+        ephemeral: true,
+      });
+    }
+    const logsText = filteredLogs
+      .slice(-10)
+      .map(
+        (log) => `\`${log.time}\` - **${log.user}** used \`/${log.command}\``,
+      )
+      .join("\n");
+    return interaction.reply({
+      content: `Last 10 command logs:\n${logsText}`,
       ephemeral: true,
     });
+  }
+
+  if (name === "trainingresults") {
+    // Show modal to send training results to a user
+    const modal = new ModalBuilder()
+      .setCustomId("trainingResultsModal")
+      .setTitle("FBI BFTC Training Results");
+
+    const userInput = new TextInputBuilder()
+      .setCustomId("traineeId")
+      .setLabel("Trainee Discord ID")
+      .setStyle(TextInputStyle.Short)
+      .setValue(interaction.options.getUser("user").id)
+      .setRequired(true);
+
+    const resultsInput = new TextInputBuilder()
+      .setCustomId("results")
+      .setLabel("Training results details")
+      .setStyle(TextInputStyle.Paragraph)
+      .setPlaceholder("Enter training results here...")
+      .setRequired(true);
+
+    const firstRow = new ActionRowBuilder().addComponents(userInput);
+    const secondRow = new ActionRowBuilder().addComponents(resultsInput);
+
+    modal.addComponents(firstRow, secondRow);
+    await interaction.showModal(modal);
   }
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
-  if (
-    interaction.isStringSelectMenu() &&
-    interaction.customId === "selectTrainingStatus"
-  ) {
-    const status = interaction.values[0];
-    const trainee = client.selectedTrainees?.[interaction.user.id];
-    if (!trainee)
-      return interaction.reply({
-        content: "No trainee found.",
+  if (interaction.type !== InteractionType.ModalSubmit) return;
+
+  if (interaction.customId === "trainingResultsModal") {
+    const traineeId = interaction.fields.getTextInputValue("traineeId");
+    const results = interaction.fields.getTextInputValue("results");
+
+    try {
+      const user = await client.users.fetch(traineeId);
+      await user.send(`📄 **FBI BFTC Training Results:**\n${results}`);
+      await interaction.reply({
+        content: `✅ Training results sent to ${user.tag}`,
         ephemeral: true,
       });
-
-    const modal = new ModalBuilder()
-      .setCustomId("trainingNotesModal")
-      .setTitle("FBI Training Result");
-
-    const noteInput = new TextInputBuilder()
-      .setCustomId("notes")
-      .setLabel(
-        status === "O"
-          ? "Why was this put on hold?"
-          : status === "R"
-            ? "What needs to be retaken?"
-            : "Instructor Notes",
-      )
-      .setStyle(TextInputStyle.Paragraph)
-      .setRequired(true);
-
-    const row = new ActionRowBuilder().addComponents(noteInput);
-    modal.addComponents(row);
-    interaction.client.trainingResults =
-      interaction.client.trainingResults || {};
-    interaction.client.trainingResults[interaction.user.id] = {
-      trainee,
-      status,
-    };
-
-    await interaction.showModal(modal);
-  } else if (
-    interaction.type === InteractionType.ModalSubmit &&
-    interaction.customId === "trainingNotesModal"
-  ) {
-    const { trainee, status } =
-      interaction.client.trainingResults?.[interaction.user.id] || {};
-    if (!trainee)
-      return interaction.reply({
-        content: "No trainee selected.",
+    } catch {
+      await interaction.reply({
+        content: `❌ Could not send results. Check the trainee ID.`,
         ephemeral: true,
       });
-
-    const notes = interaction.fields.getTextInputValue("notes");
-
-    if (status === "F") {
-      client.failCounts[trainee.id] = (client.failCounts[trainee.id] || 0) + 1;
-      saveJson(FAILCOUNTS_FILE, client.failCounts);
     }
-
-    const embed = {
-      title: "📝 FBI BFTC Results",
-      color: status === "P" ? 0x00ff00 : status === "F" ? 0xff0000 : 0xffaa00,
-      fields: [
-        { name: "👤 Trainee", value: `<@${trainee.id}>`, inline: false },
-        {
-          name: "📌 Status",
-          value:
-            status === "P"
-              ? "✅ PASS"
-              : status === "F"
-                ? "❌ FAIL"
-                : status === "O"
-                  ? "⏸️ ON HOLD"
-                  : "🔁 PARTIAL RETAKE NEEDED",
-          inline: true,
-        },
-        {
-          name:
-            status === "O"
-              ? "📥 Instructor Notes / Reason for On Hold"
-              : status === "R"
-                ? "📥 Sections to Retake"
-                : "📥 Instructor Notes",
-          value: notes,
-          inline: false,
-        },
-        {
-          name: "📘 Result Key",
-          value: "P - PASS\nF - FAIL\nO - ON HOLD\nR - PARTIAL RETAKE NEEDED",
-          inline: false,
-        },
-      ],
-      timestamp: new Date(),
-      footer: { text: "FBI Academy Training System" },
-    };
-
-    await interaction.reply({
-      content: `<@${trainee.id}>`,
-      embeds: [embed],
-      allowedMentions: { users: [trainee.id] },
-    });
   }
 });
 

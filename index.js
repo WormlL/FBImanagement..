@@ -14,6 +14,7 @@ import {
 } from "discord.js";
 import fs from "fs";
 import dotenv from "dotenv";
+import path from "path";
 dotenv.config();
 
 const client = new Client({
@@ -25,19 +26,34 @@ const REPEATS_FILE = "./repeats.json";
 const FAILCOUNTS_FILE = "./failCounts.json";
 const COMMANDLOGS_FILE = "./commandLogs.json";
 
-// Load JSON helper
-function loadJson(path, defaultData) {
+// Allowed data files (absolute paths)
+const ALLOWED_FILES = [
+  path.resolve(REPEATS_FILE),
+  path.resolve(FAILCOUNTS_FILE),
+  path.resolve(COMMANDLOGS_FILE),
+];
+
+// Secure Load JSON helper
+function loadJson(filePath, defaultData) {
+  const absPath = path.resolve(filePath);
+  if (!ALLOWED_FILES.includes(absPath)) {
+    throw new Error("Access to this file is not allowed.");
+  }
   try {
-    if (!fs.existsSync(path)) return defaultData;
-    const data = fs.readFileSync(path, "utf-8");
+    if (!fs.existsSync(absPath)) return defaultData;
+    const data = fs.readFileSync(absPath, "utf-8");
     return JSON.parse(data);
   } catch {
     return defaultData;
   }
 }
-// Save JSON helper
-function saveJson(path, data) {
-  fs.writeFileSync(path, JSON.stringify(data, null, 2));
+// Secure Save JSON helper
+function saveJson(filePath, data) {
+  const absPath = path.resolve(filePath);
+  if (!ALLOWED_FILES.includes(absPath)) {
+    throw new Error("Access to this file is not allowed.");
+  }
+  fs.writeFileSync(absPath, JSON.stringify(data, null, 2));
 }
 
 // Load stored data on startup

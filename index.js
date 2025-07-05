@@ -14,7 +14,6 @@ import {
 } from "discord.js";
 import fs from "fs";
 import dotenv from "dotenv";
-import path from "path";
 dotenv.config();
 
 const client = new Client({
@@ -22,38 +21,23 @@ const client = new Client({
 });
 
 // File paths
-const REPEATS_FILE = "./repeats.json";
-const FAILCOUNTS_FILE = "./failCounts.json";
-const COMMANDLOGS_FILE = "./commandLogs.json";
+const REPEATS_FILE = "./data/repeats.json";
+const FAILCOUNTS_FILE = "./data/failcount.json";
+const COMMANDLOGS_FILE = "./data/commandLogs.json";
 
-// Allowed data files (absolute paths)
-const ALLOWED_FILES = [
-  path.resolve(REPEATS_FILE),
-  path.resolve(FAILCOUNTS_FILE),
-  path.resolve(COMMANDLOGS_FILE),
-];
-
-// Secure Load JSON helper
-function loadJson(filePath, defaultData) {
-  const absPath = path.resolve(filePath);
-  if (!ALLOWED_FILES.includes(absPath)) {
-    throw new Error("Access to this file is not allowed.");
-  }
+// Load JSON helper
+function loadJson(path, defaultData) {
   try {
-    if (!fs.existsSync(absPath)) return defaultData;
-    const data = fs.readFileSync(absPath, "utf-8");
+    if (!fs.existsSync(path)) return defaultData;
+    const data = fs.readFileSync(path, "utf-8");
     return JSON.parse(data);
   } catch {
     return defaultData;
   }
 }
-// Secure Save JSON helper
-function saveJson(filePath, data) {
-  const absPath = path.resolve(filePath);
-  if (!ALLOWED_FILES.includes(absPath)) {
-    throw new Error("Access to this file is not allowed.");
-  }
-  fs.writeFileSync(absPath, JSON.stringify(data, null, 2));
+// Save JSON helper
+function saveJson(path, data) {
+  fs.writeFileSync(path, JSON.stringify(data, null, 2));
 }
 
 // Load stored data on startup
@@ -72,6 +56,7 @@ const COMMAND_ROLE = process.env.FBI_COMMAND_ROLE;
 const SUPERVISOR_ROLE = process.env.FBI_SUPERVISOR_ROLE;
 const ALLOWED_USER_ID = process.env.ALLOWED_USER_ID;
 const ALLOWED_USER_ID_2 = process.env.ALLOWED_USER_ID_2;
+const MANAGEMENT_ROLE_ID = process.env.MANAGEMENT_ROLE_ID;
 
 const commands = [
   new SlashCommandBuilder()
@@ -156,7 +141,11 @@ function hasFullAccess(interaction) {
   const id = interaction.user.id;
   if (id === ALLOWED_USER_ID || id === ALLOWED_USER_ID_2) return true;
   const roles = interaction.member.roles.cache;
-  return roles.has(COMMAND_ROLE) || roles.has(SUPERVISOR_ROLE);
+  return (
+    roles.has(COMMAND_ROLE) ||
+    roles.has(SUPERVISOR_ROLE) ||
+    roles.has(MANAGEMENT_ROLE_ID)
+  );
 }
 
 // Confirmation state for large pings
